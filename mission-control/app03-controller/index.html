@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Map</title>
+  <style>
+    body {
+      margin: 0;
+      display: flex;
+      justify-content: center;
+    }
+
+    img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+  </style>
+</head>
+<body>
+  <img id="map" src="build/test.png" alt="Live map">
+  <script>
+    const map = document.getElementById("map");
+    const imageUrl = new URL(map.src);
+
+    setInterval(() => {
+      imageUrl.searchParams.set("refresh", Date.now());
+      map.src = imageUrl.toString();
+    }, 100);
+  </script>
+</body>
+</html>
