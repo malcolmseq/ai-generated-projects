@@ -1,29 +1,24 @@
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <QAbstractSocket>
+#include <QByteArray>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QHostAddress>
+#include <QRandomGenerator>
+#include <QStringList>
+#include <QTextStream>
+#include <QTimer>
+#include <QUdpSocket>
 
 #include <array>
-#include <cerrno>
-#include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <iomanip>
-#include <iostream>
-#include <random>
-#include <string>
-#include <thread>
 
 namespace {
 constexpr double kCenterLatitude = 19.0760;
 constexpr double kCenterLongitude = 72.8777;
 constexpr double kRadiusKm = 3000.0;
 constexpr double kMaximumAltitudeMeters = 500.0;
-constexpr std::size_t kMaximumDatagramBytes = 1400;
-constexpr std::array<std::size_t, 3> kBatchSizes{50000, 100000, 150000};
+constexpr qsizetype kMaximumDatagramBytes = 1400;
+constexpr std::array<qsizetype, 3> kBatchSizes{50000, 100000, 150000};
 
 struct Point {
 	double latitude;
@@ -31,13 +26,13 @@ struct Point {
 	double altitude;
 };
 
-Point randomPoint(std::mt19937_64& generator) {
+Point randomPoint() {
 	constexpr double kEarthRadiusKm = 6371.0;
 	constexpr double kPi = 3.14159265358979323846;
-	std::uniform_real_distribution<double> unit(0.0, 1.0);
+	auto* generator = QRandomGenerator::global();
 
-	const double distanceKm = kRadiusKm * std::sqrt(unit(generator));
-	const double bearing = 2.0 * kPi * unit(generator);
+	const double distanceKm = kRadiusKm * std::sqrt(generator->generateDouble());
+	const double bearing = 2.0 * kPi * generator->generateDouble();
 	const double latitudeOffset = distanceKm * std::cos(bearing) / kEarthRadiusKm;
 	const double longitudeOffset = distanceKm * std::sin(bearing) /
 								   (kEarthRadiusKm * std::cos(kCenterLatitude * kPi / 180.0));
@@ -45,52 +40,39 @@ Point randomPoint(std::mt19937_64& generator) {
 	return {
 		kCenterLatitude + latitudeOffset * 180.0 / kPi,
 		kCenterLongitude + longitudeOffset * 180.0 / kPi,
-		unit(generator) * kMaximumAltitudeMeters,
+		generator->generateDouble() * kMaximumAltitudeMeters,
 	};
 }
 
-bool sendBatch(int socketFd, const sockaddr_in& destination, std::size_t batchId,
-			   std::size_t pointCount, std::mt19937_64& generator,
-			   std::size_t& totalBytesSent) {
-	std::array<char, kMaximumDatagramBytes> datagram{};
-	std::size_t pointsSent = 0;
+bool sendBatch(QUdpSocket& socket, const QHostAddress& destination, quint16 port,
+			   qsizetype batchId, qsizetype pointCount, qsizetype& totalBytesSent) {
+	qsizetype pointsSent = 0;
 	totalBytesSent = 0;
 
 	while (pointsSent < pointCount) {
-		const int headerSize = std::snprintf(datagram.data(), datagram.size(), "%zu,%zu,%zu\n",
-											 batchId, pointCount, pointsSent);
-		if (headerSize < 0 || static_cast<std::size_t>(headerSize) >= datagram.size()) {
-			std::cerr << "Could not format datagram header\n";
-			return false;
-		}
-
-		std::size_t bytesUsed = static_cast<std::size_t>(headerSize);
-		std::size_t pointsInDatagram = 0;
+		QByteArray datagram = QByteArray::number(batchId) + ',' +
+							  QByteArray::number(pointCount) + ',' +
+							  QByteArray::number(pointsSent) + '\n';
+		qsizetype pointsInDatagram = 0;
 		while (pointsSent + pointsInDatagram < pointCount) {
-			const Point point = randomPoint(generator);
-			std::array<char, 64> record{};
-			const int rowSize = std::snprintf(record.data(), record.size(), "%.6f,%.6f,%.1f\n",
-											   point.latitude, point.longitude, point.altitude);
-			if (rowSize < 0 || static_cast<std::size_t>(rowSize) >= record.size()) {
-				std::cerr << "Could not format point record\n";
-				return false;
-			}
-			if (bytesUsed + static_cast<std::size_t>(rowSize) > datagram.size()) {
+			const Point point = randomPoint();
+			QByteArray record = QByteArray::number(point.latitude, 'f', 6) + ',' +
+								QByteArray::number(point.longitude, 'f', 6) + ',' +
+								QByteArray::number(point.altitude, 'f', 1) + '\n';
+			if (datagram.size() + record.size() > kMaximumDatagramBytes) {
 				break;
 			}
-			std::memcpy(datagram.data() + bytesUsed, record.data(), static_cast<std::size_t>(rowSize));
-			bytesUsed += static_cast<std::size_t>(rowSize);
+			datagram += record;
 			++pointsInDatagram;
 		}
 
-		const ssize_t bytesSent = sendto(socketFd, datagram.data(), bytesUsed, 0,
-										 reinterpret_cast<const sockaddr*>(&destination),
-										 sizeof(destination));
-		if (bytesSent < 0 || static_cast<std::size_t>(bytesSent) != bytesUsed) {
-			std::cerr << "sendto failed: " << std::strerror(errno) << '\n';
+		const qint64 bytesSent = socket.writeDatagram(datagram, destination, port);
+		if (bytesSent != datagram.size()) {
+			QTextStream(stderr) << "Could not send UDP datagram: "
+								<< socket.errorString() << Qt::endl;
 			return false;
 		}
-		totalBytesSent += static_cast<std::size_t>(bytesSent);
+		totalBytesSent += bytesSent;
 		pointsSent += pointsInDatagram;
 	}
 	return true;
@@ -98,58 +80,58 @@ bool sendBatch(int socketFd, const sockaddr_in& destination, std::size_t batchId
 }  // namespace
 
 int main(int argc, char* argv[]) {
-	if (argc != 3) {
-		std::cerr << "Usage: " << argv[0] << " <destination-ipv4> <port>\n";
-		return EXIT_FAILURE;
+	QCoreApplication application(argc, argv);
+	const QStringList arguments = application.arguments();
+	if (arguments.size() != 3) {
+		QTextStream(stderr) << "Usage: " << arguments[0]
+							<< " <destination-ipv4> <port>\n";
+		return 1;
 	}
 
-	char* end = nullptr;
-	const long port = std::strtol(argv[2], &end, 10);
-	if (end == argv[2] || *end != '\0' || port < 1 || port > 65535) {
-		std::cerr << "Port must be an integer between 1 and 65535\n";
-		return EXIT_FAILURE;
+	QHostAddress destination;
+	if (!destination.setAddress(arguments[1]) ||
+		destination.protocol() != QAbstractSocket::IPv4Protocol) {
+		QTextStream(stderr) << "Destination must be a valid IPv4 address\n";
+		return 1;
 	}
 
-	sockaddr_in destination{};
-	destination.sin_family = AF_INET;
-	destination.sin_port = htons(static_cast<uint16_t>(port));
-	if (inet_pton(AF_INET, argv[1], &destination.sin_addr) != 1) {
-		std::cerr << "Destination must be a valid IPv4 address\n";
-		return EXIT_FAILURE;
+	bool validPort = false;
+	const int parsedPort = arguments[2].toInt(&validPort);
+	if (!validPort || parsedPort < 1 || parsedPort > 65535) {
+		QTextStream(stderr) << "Port must be an integer between 1 and 65535\n";
+		return 1;
 	}
 
-	const int socketFd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (socketFd < 0) {
-		std::cerr << "Could not create UDP socket: " << std::strerror(errno) << '\n';
-		return EXIT_FAILURE;
-	}
-
-	std::random_device seed;
-	std::mt19937_64 generator(seed());
-	std::size_t batchId = 0;
-	auto nextBatch = std::chrono::steady_clock::now();
-
-	while (true) {
-		std::this_thread::sleep_until(nextBatch);
-		const std::size_t pointCount = kBatchSizes[batchId % kBatchSizes.size()];
-		std::size_t totalBytesSent = 0;
-		if (!sendBatch(socketFd, destination, batchId, pointCount, generator, totalBytesSent)) {
-			close(socketFd);
-			return EXIT_FAILURE;
+	QUdpSocket socket;
+	qsizetype batchId = 0;
+	auto sendNextBatch = [&]() {
+		const qsizetype pointCount = kBatchSizes[batchId % kBatchSizes.size()];
+		qsizetype totalBytesSent = 0;
+		if (!sendBatch(socket, destination, static_cast<quint16>(parsedPort),
+					   batchId, pointCount, totalBytesSent)) {
+			return false;
 		}
 
-		const auto now = std::chrono::system_clock::now();
-		const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
-			now.time_since_epoch()) % 1000;
-		const std::time_t timestamp = std::chrono::system_clock::to_time_t(now);
-		std::tm localTime{};
-		localtime_r(&timestamp, &localTime);
-
-		std::cout << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S") << '.'
-				  << std::setfill('0') << std::setw(3) << milliseconds.count()
-				  << std::setfill(' ') << " Sent batch " << batchId << " with "
-				  << pointCount << " points, " << totalBytesSent << " bytes\n";
+		QTextStream(stdout)
+			<< QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
+			<< " Sent batch " << batchId << " with " << pointCount << " points, "
+			<< totalBytesSent << " bytes" << Qt::endl;
 		++batchId;
-		nextBatch += std::chrono::seconds(1);
+		return true;
+	};
+
+	QTimer timer;
+	timer.setInterval(5000);
+	QObject::connect(&timer, &QTimer::timeout, &application, [&]() {
+		if (!sendNextBatch()) {
+			timer.stop();
+			application.exit(1);
+		}
+	});
+	timer.start();
+
+	if (!sendNextBatch()) {
+		return 1;
 	}
+	return application.exec();
 }

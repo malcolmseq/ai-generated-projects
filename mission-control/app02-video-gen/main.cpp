@@ -1,6 +1,7 @@
 #include "video_generator.h"
 
-#include <atomic>
+#include <QCoreApplication>
+
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -8,10 +9,10 @@
 #include <string>
 
 namespace {
-std::atomic_bool running{true};
-
 void handleSignal(int) {
-	running = false;
+	if (QCoreApplication::instance()) {
+		QCoreApplication::quit();
+	}
 }
 
 bool parsePort(const char* value, int& port) {
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
 	std::signal(SIGINT, handleSignal);
 	std::signal(SIGTERM, handleSignal);
 
+	QCoreApplication application(argc, argv);
 	VideoGenerator generator(pointsPort, mapPort, argv[3], argv[4]);
-	return generator.run(running) ? EXIT_SUCCESS : EXIT_FAILURE;
+	return generator.run() ? EXIT_SUCCESS : EXIT_FAILURE;
 }

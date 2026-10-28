@@ -1,10 +1,13 @@
 #include "video_generator.h"
 
-#include <arpa/inet.h>
-#include <png.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <QBrush>
+#include <QColor>
+#include <QCoreApplication>
+#include <QImage>
+#include <QPainter>
+#include <QPen>
+#include <QString>
+#include <QUdpSocket>
 
 #include <algorithm>
 #include <array>
@@ -48,78 +51,6 @@ struct PixelCoordinate {
 	double y;
 };
 
-std::array<unsigned char, 7> timestampGlyph(char character) {
-	switch (character) {
-	case '0': return {14, 17, 19, 21, 25, 17, 14};
-	case '1': return {4, 12, 4, 4, 4, 4, 14};
-	case '2': return {14, 17, 1, 2, 4, 8, 31};
-	case '3': return {30, 1, 1, 14, 1, 1, 30};
-	case '4': return {2, 6, 10, 18, 31, 2, 2};
-	case '5': return {31, 16, 16, 30, 1, 1, 30};
-	case '6': return {6, 8, 16, 30, 17, 17, 14};
-	case '7': return {31, 1, 2, 4, 8, 8, 8};
-	case '8': return {14, 17, 17, 14, 17, 17, 14};
-	case '9': return {14, 17, 17, 15, 1, 2, 12};
-	case '-': return {0, 0, 0, 31, 0, 0, 0};
-	case ':': return {0, 4, 4, 0, 4, 4, 0};
-	case '.': return {0, 0, 0, 0, 0, 6, 6};
-	default: return {};
-	}
-}
-
-void drawTimestamp(std::vector<png_byte>& pixels, const std::string& timestamp) {
-	constexpr int scale = 3;
-	constexpr int glyphWidth = 5;
-	constexpr int glyphHeight = 7;
-	constexpr int characterSpacing = 1;
-	constexpr int paddingX = 12;
-	constexpr int paddingY = 8;
-	const int textWidth =
-		static_cast<int>(timestamp.size()) * (glyphWidth + characterSpacing) * scale -
-		characterSpacing * scale;
-	const int panelWidth = textWidth + paddingX * 2;
-	const int panelHeight = glyphHeight * scale + paddingY * 2;
-	const int panelLeft = (kMapWidth - panelWidth) / 2;
-	const int panelTop = kMapHeight - panelHeight;
-
-	for (int y = panelTop; y < kMapHeight; ++y) {
-		for (int x = panelLeft; x < panelLeft + panelWidth; ++x) {
-			const std::size_t pixelIndex =
-				(static_cast<std::size_t>(y) * kMapWidth + x) * 4;
-			pixels[pixelIndex] = 32;
-			pixels[pixelIndex + 1] = 32;
-			pixels[pixelIndex + 2] = 32;
-			pixels[pixelIndex + 3] = 255;
-		}
-	}
-
-	const int textLeft = panelLeft + paddingX;
-	const int textTop = panelTop + paddingY;
-	for (std::size_t characterIndex = 0; characterIndex < timestamp.size(); ++characterIndex) {
-		const auto glyph = timestampGlyph(timestamp[characterIndex]);
-		const int glyphLeft =
-			textLeft + static_cast<int>(characterIndex) * (glyphWidth + characterSpacing) * scale;
-		for (int row = 0; row < glyphHeight; ++row) {
-			for (int column = 0; column < glyphWidth; ++column) {
-				if ((glyph[static_cast<std::size_t>(row)] & (1 << (glyphWidth - column - 1))) == 0) {
-					continue;
-				}
-				for (int dy = 0; dy < scale; ++dy) {
-					for (int dx = 0; dx < scale; ++dx) {
-						const int x = glyphLeft + column * scale + dx;
-						const int y = textTop + row * scale + dy;
-						const std::size_t pixelIndex =
-							(static_cast<std::size_t>(y) * kMapWidth + x) * 4;
-						pixels[pixelIndex] = 255;
-						pixels[pixelIndex + 1] = 255;
-						pixels[pixelIndex + 2] = 255;
-						pixels[pixelIndex + 3] = 255;
-					}
-				}
-			}
-		}
-	}
-}
 
 bool isMissingTileError(const std::error_code& error) {
 	return error == std::errc::no_such_file_or_directory ||
@@ -198,63 +129,26 @@ PixelCoordinate project(double latitude, double longitude, int zoom) {
 	};
 }
 
-bool bindUdpSocket(int port, int& socketFd) {
-	socketFd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (socketFd < 0) {
-		std::cerr << "Could not create UDP socket for port " << port << ": "
-				  << std::strerror(errno) << '\n';
+}  // namespace
+
+bool VideoGenerator::bindUdpSocket(QUdpSocket& socket, int port) {
+	if (port < 1 || port > 65535) {
+		std::cerr << "Invalid UDP port value " << port
+				  << ": expected a value between 1 and 65535\n";
 		return false;
 	}
 
-	const int reuseAddress = 1;
-	if (setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR, &reuseAddress,
-				   sizeof(reuseAddress)) < 0) {
-		std::cerr << "Could not configure UDP socket for port " << port << ": "
-				  << std::strerror(errno) << '\n';
-		close(socketFd);
-		socketFd = -1;
+	if (!socket.bind(QHostAddress::AnyIPv4, static_cast<quint16>(port))) {
+		std::cerr << "Could not bind UDP socket to port " << port << ".\n"
+				  << "Qt error: " << socket.errorString().toStdString() << '\n'
+				  << "Common causes: another process is using this port, the port is blocked, or "
+				  << "the OS refuses the bind request.\n";
 		return false;
 	}
 
-	sockaddr_in localAddress{};
-	localAddress.sin_family = AF_INET;
-	localAddress.sin_addr.s_addr = htonl(INADDR_ANY);
-	localAddress.sin_port = htons(static_cast<uint16_t>(port));
-	if (bind(socketFd, reinterpret_cast<const sockaddr*>(&localAddress),
-			 sizeof(localAddress)) < 0) {
-		std::cerr << "Could not bind UDP port " << port << ": " << std::strerror(errno)
-				  << '\n';
-		close(socketFd);
-		socketFd = -1;
-		return false;
-	}
+	std::cout << "Bound UDP socket successfully on port " << port << '\n';
 	return true;
 }
-
-bool waitForDatagram(int socketFd, std::atomic_bool& running, std::atomic_bool& failed) {
-	pollfd descriptor{socketFd, POLLIN, 0};
-	const int pollResult = poll(&descriptor, 1, kPollTimeoutMilliseconds);
-	if (pollResult == 0) {
-		return false;
-	}
-	if (pollResult < 0) {
-		if (errno == EINTR) {
-			return false;
-		}
-		std::cerr << currentTimestamp() << " poll failed: " << std::strerror(errno) << '\n';
-		failed = true;
-		running = false;
-		return false;
-	}
-	if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-		std::cerr << currentTimestamp() << " UDP socket reported a polling error\n";
-		failed = true;
-		running = false;
-		return false;
-	}
-	return (descriptor.revents & POLLIN) != 0;
-}
-}  // namespace
 
 VideoGenerator::VideoGenerator(int pointsPort, int mapPort,
 							   std::filesystem::path tilesDirectory,
@@ -262,72 +156,62 @@ VideoGenerator::VideoGenerator(int pointsPort, int mapPort,
 	: pointsPort_(pointsPort),
 	  mapPort_(mapPort),
 	  tilesDirectory_(std::move(tilesDirectory)),
-	  outputPath_(std::move(outputPath)) {}
-
-bool VideoGenerator::run(std::atomic_bool& running) {
-	int pointsSocket = -1;
-	int mapSocket = -1;
-	if (!bindUdpSocket(pointsPort_, pointsSocket)) {
-		return false;
+	  outputPath_(std::move(outputPath)) {
+	if (pointsPort_ == mapPort_) {
+		std::cerr << "Startup error: the points UDP port and map UDP port are the same ("
+				  << pointsPort_ << "). They must be different.\n";
+		failed_ = true;
 	}
-	if (!bindUdpSocket(mapPort_, mapSocket)) {
-		close(pointsSocket);
-		return false;
+	if (!bindUdpSocket(pointsSocket_, pointsPort_)) {
+		std::cerr << "Startup error: failed to bind the points UDP socket on port "
+				  << pointsPort_ << '\n';
+		failed_ = true;
 	}
-
-	std::cout << "Listening for UDP point batches on port " << pointsPort_ << '\n'
-			  << "Listening for map updates (zoom,latitude,longitude) on port " << mapPort_
-			  << '\n';
-	std::thread pointReceiver(&VideoGenerator::receivePoints, this, pointsSocket,
-							  std::ref(running));
-	std::thread mapReceiver(&VideoGenerator::receiveMapView, this, mapSocket,
-							std::ref(running));
-	std::thread mapRenderer(&VideoGenerator::renderMaps, this, std::ref(running));
-
-	while (running) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	if (!bindUdpSocket(mapSocket_, mapPort_)) {
+		std::cerr << "Startup error: failed to bind the map UDP socket on port "
+				  << mapPort_ << '\n';
+		failed_ = true;
 	}
-	stateChanged_.notify_all();
-
-	pointReceiver.join();
-	mapReceiver.join();
-	mapRenderer.join();
-	close(pointsSocket);
-	close(mapSocket);
-	return !failed_;
+	if (!failed_) {
+		connect(&pointsSocket_, &QUdpSocket::readyRead, this, &VideoGenerator::onPointsReadyRead);
+		connect(&mapSocket_, &QUdpSocket::readyRead, this, &VideoGenerator::onMapReadyRead);
+		connect(&renderTimer_, &QTimer::timeout, this, &VideoGenerator::renderNextFrame);
+		renderTimer_.setInterval(100);
+	}
 }
 
-void VideoGenerator::receivePoints(int socketFd, std::atomic_bool& running) {
-	std::array<char, 65536> buffer{};
-	std::unordered_map<std::size_t, Transmission> transmissions;
+bool VideoGenerator::run() {
+	if (failed_) {
+		std::cerr << "VideoGenerator startup failed before the event loop began.\n"
+				  << "Point socket open = " << pointsSocket_.isOpen() << ", "
+				  << "map socket open = " << mapSocket_.isOpen() << '\n';
+		return false;
+	}
+	std::cout << "Listening for UDP point batches on port " << pointsPort_ << '\n'
+				  << "Listening for map updates (zoom,latitude,longitude) on port " << mapPort_
+				  << '\n';
+	renderTimer_.start();
+	return QCoreApplication::exec() == 0 && !failed_;
+}
 
-	while (running) {
-		if (!waitForDatagram(socketFd, running, failed_)) {
-			continue;
-		}
-
-		sockaddr_in sender{};
-		socklen_t senderLength = sizeof(sender);
-		const ssize_t bytesReceived = recvfrom(socketFd, buffer.data(), buffer.size(), 0,
-											  reinterpret_cast<sockaddr*>(&sender), &senderLength);
+void VideoGenerator::onPointsReadyRead() {
+	static std::unordered_map<std::size_t, Transmission> transmissions;
+	while (pointsSocket_.hasPendingDatagrams()) {
+		QByteArray datagram;
+		datagram.resize(static_cast<int>(pointsSocket_.pendingDatagramSize()));
+		QHostAddress senderAddress;
+		quint16 senderPort = 0;
+		const qint64 bytesReceived = pointsSocket_.readDatagram(datagram.data(), datagram.size(),
+													 &senderAddress, &senderPort);
 		if (bytesReceived < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			std::cerr << currentTimestamp() << " recvfrom on point port failed: "
-					  << std::strerror(errno) << '\n';
+			std::cerr << currentTimestamp() << " readDatagram on point port failed: "
+					  << pointsSocket_.errorString().toStdString() << '\n';
 			failed_ = true;
-			running = false;
-			stateChanged_.notify_all();
-			break;
+			QCoreApplication::quit();
+			return;
 		}
 
-		char senderAddress[INET_ADDRSTRLEN]{};
-		if (inet_ntop(AF_INET, &sender.sin_addr, senderAddress, sizeof(senderAddress)) == nullptr) {
-			std::strncpy(senderAddress, "unknown", sizeof(senderAddress) - 1);
-		}
-
-		const std::string payload(buffer.data(), static_cast<std::size_t>(bytesReceived));
+		const std::string payload(datagram.constData(), static_cast<std::size_t>(bytesReceived));
 		std::istringstream packet(payload);
 		std::string header;
 		std::size_t batchId = 0;
@@ -337,7 +221,7 @@ void VideoGenerator::receivePoints(int socketFd, std::atomic_bool& running) {
 			!parseHeader(header, batchId, totalPoints, pointOffset) || totalPoints == 0 ||
 			totalPoints > kMaximumRowsPerTransmission || pointOffset >= totalPoints) {
 			std::cerr << currentTimestamp() << " Ignoring malformed point datagram from "
-					  << senderAddress << ':' << ntohs(sender.sin_port) << '\n';
+					  << senderAddress.toString().toStdString() << ':' << senderPort << '\n';
 			continue;
 		}
 
@@ -412,28 +296,23 @@ void VideoGenerator::receivePoints(int socketFd, std::atomic_bool& running) {
 	}
 }
 
-void VideoGenerator::receiveMapView(int socketFd, std::atomic_bool& running) {
-	std::array<char, 65536> buffer{};
-	while (running) {
-		if (!waitForDatagram(socketFd, running, failed_)) {
-			continue;
-		}
-
-		const ssize_t bytesReceived =
-			recvfrom(socketFd, buffer.data(), buffer.size(), 0, nullptr, nullptr);
+void VideoGenerator::onMapReadyRead() {
+	while (mapSocket_.hasPendingDatagrams()) {
+		QByteArray datagram;
+		datagram.resize(static_cast<int>(mapSocket_.pendingDatagramSize()));
+		QHostAddress senderAddress;
+		quint16 senderPort = 0;
+		const qint64 bytesReceived = mapSocket_.readDatagram(datagram.data(), datagram.size(),
+												 &senderAddress, &senderPort);
 		if (bytesReceived < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			std::cerr << currentTimestamp() << " recvfrom on map port failed: "
-					  << std::strerror(errno) << '\n';
+			std::cerr << currentTimestamp() << " readDatagram on map port failed: "
+					  << mapSocket_.errorString().toStdString() << '\n';
 			failed_ = true;
-			running = false;
-			stateChanged_.notify_all();
-			break;
+			QCoreApplication::quit();
+			return;
 		}
 
-		const std::string payload(buffer.data(), static_cast<std::size_t>(bytesReceived));
+		const std::string payload(datagram.constData(), static_cast<std::size_t>(bytesReceived));
 		MapView view;
 		if (!parseMapView(payload, view.zoom, view.latitude, view.longitude)) {
 			std::cerr << currentTimestamp()
@@ -443,7 +322,7 @@ void VideoGenerator::receiveMapView(int socketFd, std::atomic_bool& running) {
 		}
 		publishMapView(view);
 		std::cout << currentTimestamp() << " Map view updated: zoom " << view.zoom
-				  << ", center " << view.latitude << ',' << view.longitude << '\n';
+					  << ", center " << view.latitude << ',' << view.longitude << '\n';
 	}
 }
 
@@ -453,7 +332,9 @@ void VideoGenerator::publishPoints(std::vector<Point> points) {
 		points_ = std::move(points);
 		++revision_;
 	}
-	stateChanged_.notify_one();
+	if (renderTimer_.isActive()) {
+		renderTimer_.start();
+	}
 }
 
 void VideoGenerator::publishMapView(const MapView& view) {
@@ -462,36 +343,32 @@ void VideoGenerator::publishMapView(const MapView& view) {
 		mapView_ = view;
 		++revision_;
 	}
-	stateChanged_.notify_one();
+	if (renderTimer_.isActive()) {
+		renderTimer_.start();
+	}
 }
 
-void VideoGenerator::renderMaps(std::atomic_bool& running) {
-	std::size_t renderedRevision = std::numeric_limits<std::size_t>::max();
-	while (running) {
-		std::vector<Point> points;
-		MapView view;
-		std::size_t currentRevision = 0;
-		{
-			std::unique_lock<std::mutex> lock(stateMutex_);
-			stateChanged_.wait(lock, [&] { return !running || revision_ != renderedRevision; });
-			if (!running) {
-				break;
-			}
-			points = points_;
-			view = mapView_;
-			currentRevision = revision_;
+void VideoGenerator::renderNextFrame() {
+	std::vector<Point> points;
+	MapView view;
+	std::size_t currentRevision = 0;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (revision_ == renderedRevision_) {
+			return;
 		}
+		points = points_;
+		view = mapView_;
+		currentRevision = revision_;
+	}
 
-		if (renderMap(points, view)) {
-			renderedRevision = currentRevision;
-			std::cout << currentTimestamp() << " Wrote " << points.size()
-					  << " points to PNG " << outputPath_ << '\n';
-		} else {
-			failed_ = true;
-			running = false;
-			stateChanged_.notify_all();
-			break;
-		}
+	if (renderMap(points, view)) {
+		renderedRevision_ = currentRevision;
+		std::cout << currentTimestamp() << " Wrote " << points.size()
+			  << " points to PNG " << outputPath_ << '\n';
+	} else {
+		failed_ = true;
+		QCoreApplication::quit();
 	}
 }
 
@@ -499,12 +376,6 @@ bool VideoGenerator::renderMap(const std::vector<Point>& points, const MapView& 
 	const PixelCoordinate center = project(view.latitude, view.longitude, view.zoom);
 	const double originX = center.x - kMapWidth / 2.0;
 	const double originY = center.y - kMapHeight / 2.0;
-	std::vector<png_byte> pixels(
-		static_cast<std::size_t>(kMapWidth) * kMapHeight * PNG_IMAGE_SAMPLE_CHANNELS(PNG_FORMAT_RGBA),
-		0xe6);
-	for (std::size_t index = 3; index < pixels.size(); index += 4) {
-		pixels[index] = 0xff;
-	}
 
 	std::filesystem::path temporaryPath = outputPath_;
 	temporaryPath += ".tmp";
@@ -558,13 +429,13 @@ bool VideoGenerator::renderMap(const std::vector<Point>& points, const MapView& 
 	}
 	if (!hasVisibleTile) {
 		std::cerr << currentTimestamp() << " No local map tiles found under "
-				  << tilesDirectory_ << " for the requested map view\n";
+					  << tilesDirectory_ << " for the requested map view\n";
 		return false;
 	}
 
 	if (tileZoom < view.zoom) {
 		std::cerr << currentTimestamp() << " Using zoom " << tileZoom
-				  << " local tiles scaled for requested zoom " << view.zoom << '\n';
+					  << " local tiles scaled for requested zoom " << view.zoom << '\n';
 	}
 
 	const int tileScale = 1 << (view.zoom - tileZoom);
@@ -576,6 +447,13 @@ bool VideoGenerator::renderMap(const std::vector<Point>& points, const MapView& 
 	const int visibleRows = kMapHeight / tileSize + 1;
 	int renderedTiles = 0;
 	int missingTiles = 0;
+
+	QImage mapImage(kMapWidth, kMapHeight, QImage::Format_ARGB32_Premultiplied);
+	mapImage.fill(QColor(230, 230, 230));
+	QPainter painter(&mapImage);
+	painter.setRenderHint(QPainter::Antialiasing, true);
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
 	for (int row = 0; row <= visibleRows; ++row) {
 		const int tileY = firstTileY + row;
 		if (tileY < 0 || tileY >= tileCount) {
@@ -594,68 +472,34 @@ bool VideoGenerator::renderMap(const std::vector<Point>& points, const MapView& 
 				++missingTiles;
 				continue;
 			}
-			png_image tileImage{};
-			tileImage.version = PNG_IMAGE_VERSION;
-			if (!png_image_begin_read_from_file(&tileImage, tilePath.c_str())) {
+
+			QImage tileImage(QString::fromStdString(tilePath.string()));
+			if (tileImage.isNull()) {
 				std::cerr << currentTimestamp() << " Could not decode map tile " << tilePath
-						  << ": " << tileImage.message << '\n';
+					  << '\n';
 				return false;
 			}
-			tileImage.format = PNG_FORMAT_RGBA;
-			std::vector<png_byte> tilePixels(PNG_IMAGE_SIZE(tileImage));
-			if (!png_image_finish_read(&tileImage, nullptr, tilePixels.data(), 0, nullptr)) {
-				std::cerr << currentTimestamp() << " Could not read map tile " << tilePath
-						  << ": " << tileImage.message << '\n';
-				png_image_free(&tileImage);
-				return false;
-			}
-			if (tileImage.width != kTileSize || tileImage.height != kTileSize) {
+			if (tileImage.width() != kTileSize || tileImage.height() != kTileSize) {
 				std::cerr << currentTimestamp() << " Unexpected dimensions for map tile "
-						  << tilePath << ": " << tileImage.width << 'x' << tileImage.height
-						  << '\n';
-				png_image_free(&tileImage);
+					  << tilePath << ": " << tileImage.width() << 'x' << tileImage.height()
+					  << '\n';
 				return false;
 			}
 
 			const double tileLeft = tileX * tileSize - originX;
 			const double tileTop = tileY * tileSize - originY;
-			const int startX = std::max(0, static_cast<int>(std::ceil(tileLeft)));
-			const int endX = std::min(kMapWidth,
-									  static_cast<int>(std::ceil(tileLeft + tileSize)));
-			const int startY = std::max(0, static_cast<int>(std::ceil(tileTop)));
-			const int endY = std::min(kMapHeight,
-									  static_cast<int>(std::ceil(tileTop + tileSize)));
-			for (int y = startY; y < endY; ++y) {
-				const int sourceY = std::clamp(
-					static_cast<int>((y + 0.5 - tileTop) / tileScale), 0, kTileSize - 1);
-				for (int x = startX; x < endX; ++x) {
-					const int sourceX = std::clamp(
-						static_cast<int>((x + 0.5 - tileLeft) / tileScale), 0, kTileSize - 1);
-					const std::size_t sourceIndex =
-						(static_cast<std::size_t>(sourceY) * kTileSize + sourceX) * 4;
-					const std::size_t destinationIndex =
-						(static_cast<std::size_t>(y) * kMapWidth + x) * 4;
-					const unsigned int alpha = tilePixels[sourceIndex + 3];
-					for (std::size_t channel = 0; channel < 3; ++channel) {
-						pixels[destinationIndex + channel] = static_cast<png_byte>(
-							(tilePixels[sourceIndex + channel] * alpha +
-							 pixels[destinationIndex + channel] * (255 - alpha)) /
-							255);
-					}
-				}
-			}
-			png_image_free(&tileImage);
+			painter.drawImage(QRectF(tileLeft, tileTop, tileSize, tileSize), tileImage);
 			++renderedTiles;
 		}
 	}
 	if (renderedTiles == 0) {
 		std::cerr << currentTimestamp() << " No local map tiles found under "
-				  << tilesDirectory_ << " for zoom " << tileZoom << '\n';
+					  << tilesDirectory_ << " for zoom " << tileZoom << '\n';
 		return false;
 	}
 	if (missingTiles > 0) {
 		std::cerr << currentTimestamp() << " " << missingTiles
-				  << " visible local map tiles are missing for zoom " << tileZoom << '\n';
+					  << " visible local map tiles are missing for zoom " << tileZoom << '\n';
 	}
 
 	for (const Point& point : points) {
@@ -673,49 +517,26 @@ bool VideoGenerator::renderMap(const std::vector<Point>& points, const MapView& 
 			centerY < -7 || centerY >= kMapHeight + 7) {
 			continue;
 		}
-		for (int offsetY = -6; offsetY <= 6; ++offsetY) {
-			for (int offsetX = -6; offsetX <= 6; ++offsetX) {
-				const int x = centerX + offsetX;
-				const int y = centerY + offsetY;
-				if (x < 0 || x >= kMapWidth || y < 0 || y >= kMapHeight) {
-					continue;
-				}
-				const int distanceSquared = offsetX * offsetX + offsetY * offsetY;
-				if (distanceSquared > 36) {
-					continue;
-				}
-				const std::size_t pixelIndex =
-					(static_cast<std::size_t>(y) * kMapWidth + x) * 4;
-				const bool outline = distanceSquared >= 20;
-				pixels[pixelIndex] = outline ? 255 : 229;
-				pixels[pixelIndex + 1] = outline ? 255 : 57;
-				pixels[pixelIndex + 2] = outline ? 255 : 53;
-				pixels[pixelIndex + 3] = 255;
-			}
-		}
-	}
-	drawTimestamp(pixels, currentTimestamp());
 
-	png_image outputImage{};
-	outputImage.version = PNG_IMAGE_VERSION;
-	outputImage.width = kMapWidth;
-	outputImage.height = kMapHeight;
-	outputImage.format = PNG_FORMAT_RGBA;
-	if (!png_image_write_to_file(&outputImage, temporaryPath.c_str(), 0,
-								 pixels.data(), 0, nullptr)) {
-		std::cerr << currentTimestamp() << " Failed writing PNG map " << temporaryPath
-				  << ": " << outputImage.message << '\n';
-		png_image_free(&outputImage);
+		painter.setPen(Qt::NoPen);
+		painter.setBrush(QColor(255, 255, 255));
+		painter.drawEllipse(QPoint(centerX, centerY), 7, 7);
+		painter.setBrush(QColor(229, 57, 53));
+		painter.drawEllipse(QPoint(centerX, centerY), 5, 5);
+	}
+	painter.end();
+
+	if (!mapImage.save(QString::fromStdString(temporaryPath.string()), "PNG")) {
+		std::cerr << currentTimestamp() << " Failed writing PNG map " << temporaryPath << '\n';
 		removeTemporaryOutput();
 		return false;
 	}
-	png_image_free(&outputImage);
 
 	std::error_code error;
 	std::filesystem::rename(temporaryPath, outputPath_, error);
 	if (error) {
 		std::cerr << currentTimestamp() << " Could not publish map output " << outputPath_
-				  << ": " << error.message() << '\n';
+					  << ": " << error.message() << '\n';
 		removeTemporaryOutput();
 		return false;
 	}

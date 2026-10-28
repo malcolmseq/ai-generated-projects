@@ -1,12 +1,13 @@
 #pragma once
 
+#include <QObject>
+#include <QTimer>
+#include <QUdpSocket>
+
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <mutex>
-#include <string>
-#include <thread>
 #include <vector>
 
 struct Point {
@@ -15,14 +16,21 @@ struct Point {
 	double altitude;
 };
 
-class VideoGenerator {
+class VideoGenerator : public QObject {
+	Q_OBJECT
+
 public:
 	VideoGenerator(int pointsPort, int mapPort, std::filesystem::path tilesDirectory,
 				   std::filesystem::path outputPath);
 	VideoGenerator(const VideoGenerator&) = delete;
 	VideoGenerator& operator=(const VideoGenerator&) = delete;
 
-	bool run(std::atomic_bool& running);
+	bool run();
+
+private slots:
+	void onPointsReadyRead();
+	void onMapReadyRead();
+	void renderNextFrame();
 
 private:
 	struct MapView {
@@ -31,9 +39,7 @@ private:
 		double longitude = 72.877426;
 	};
 
-	void receivePoints(int socketFd, std::atomic_bool& running);
-	void receiveMapView(int socketFd, std::atomic_bool& running);
-	void renderMaps(std::atomic_bool& running);
+	bool bindUdpSocket(QUdpSocket& socket, int port);
 	void publishPoints(std::vector<Point> points);
 	void publishMapView(const MapView& view);
 	bool renderMap(const std::vector<Point>& points, const MapView& view) const;
@@ -43,9 +49,12 @@ private:
 	std::filesystem::path tilesDirectory_;
 	std::filesystem::path outputPath_;
 	std::mutex stateMutex_;
-	std::condition_variable stateChanged_;
 	std::vector<Point> points_;
 	MapView mapView_;
 	std::size_t revision_ = 1;
+	std::size_t renderedRevision_ = 0;
 	std::atomic_bool failed_{false};
+	QUdpSocket pointsSocket_;
+	QUdpSocket mapSocket_;
+	QTimer renderTimer_;
 };
